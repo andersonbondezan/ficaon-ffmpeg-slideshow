@@ -11,7 +11,7 @@ TOKEN = os.environ.get("SLIDESHOW_TOKEN", "ugc_slideshow_7yKp29Qm")
 
 def fetch(url, path):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
+    with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
         f.write(r.read())
 
 
@@ -70,6 +70,61 @@ def slideshow():
             return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
 
         return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="reel.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.route("/concat", methods=["POST"])
+def concat():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    videos = data.get("videos") or []
+    videos = [u for u in videos if isinstance(u, str) and u.startswith("http")][:8]
+    if len(videos) < 1:
+        return jsonify({"error": "need at least 1 video URL"}), 400
+
+    work = tempfile.mkdtemp()
+    try:
+        paths = []
+        for i, url in enumerate(videos):
+            p = os.path.join(work, "clip%d.mp4" % i)
+            fetch(url, p)
+            paths.append(p)
+
+        out = os.path.join(work, "final.mp4")
+
+        # Re-encode each clip to a common format (1080x1920, 30fps, stereo 44.1k)
+        # and concat preserving audio. Robust even if clips differ slightly.
+        inputs = []
+        for p in paths:
+            inputs += ["-i", p]
+
+        parts = []
+        for i in range(len(paths)):
+            parts.append(
+                "[%d:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v%d];"
+                "[%d:a]aresample=44100,aformat=channel_layouts=stereo[a%d]"
+                % (i, i, i, i)
+            )
+        concat_in = "".join("[v%d][a%d]" % (i, i) for i in range(len(paths)))
+        filt = ";".join(parts) + ";%sconcat=n=%d:v=1:a=1[v][a]" % (concat_in, len(paths))
+
+        cmd = ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", filt,
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="final.mp4")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
