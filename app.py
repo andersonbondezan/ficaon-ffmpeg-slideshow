@@ -141,9 +141,7 @@ def watermark():
 
     data = request.get_json(force=True, silent=True) or {}
     video_url = data.get("video")
-    text = str(data.get("text") or "Fica ON Brasil")
-    if not video_url or not isinstance(video_url, str) or not video_url.startswith("http"):
-        return jsonify({"error": "need a video URL"}), 400
+    text = str(data.get("text") or request.args.get("text") or "Fica ON Brasil")
 
     # escapa aspas simples e dois-pontos, que quebram a sintaxe do filtro drawtext
     safe_text = text.replace("\\", "").replace("'", "").replace(":", "\\:")
@@ -151,7 +149,14 @@ def watermark():
     work = tempfile.mkdtemp()
     try:
         src = os.path.join(work, "in.mp4")
-        fetch(video_url, src)
+        if video_url and isinstance(video_url, str) and video_url.startswith("http"):
+            fetch(video_url, src)
+        elif request.data:
+            # corpo cru (binario) enviado direto, sem passar por uma URL publica
+            with open(src, "wb") as f:
+                f.write(request.data)
+        else:
+            return jsonify({"error": "need a video URL (JSON {video: url}) or raw video body"}), 400
         out = os.path.join(work, "watermarked.mp4")
 
         drawtext = (

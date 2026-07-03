@@ -17,6 +17,8 @@ Retorna o arquivo `reel.mp4` (binário, video/mp4). `GET /health` → `ok`.
 ```json
 { "video": "https://...clipe.mp4", "text": "Fica ON Brasil" }
 ```
+Ou envie o vídeo direto no corpo (binário, `Content-Type: video/mp4`) e passe o texto via query string `?text=Fica%20ON%20Brasil` — útil quando o vídeo já está em memória no n8n (ex: saída do `/concat`) e não tem URL pública.
+
 Queima o texto (marca) no rodapé do vídeo via ffmpeg `drawtext` (`text` é opcional, default "Fica ON Brasil"). Retorna `watermarked.mp4`.
 
 ## Deploy no EasyPanel (mesma stack/projeto do n8n)
