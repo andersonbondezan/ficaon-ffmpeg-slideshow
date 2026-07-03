@@ -11,6 +11,14 @@ de uma lista de URLs de imagem. Usado para gerar Reels no autoblog do Fica ON Br
 ```
 Retorna o arquivo `reel.mp4` (binário, video/mp4). `GET /health` → `ok`.
 
+## Endpoint /watermark
+`POST /watermark` (header `x-token: ugc_slideshow_7yKp29Qm`)
+
+```json
+{ "video": "https://...clipe.mp4", "text": "Fica ON Brasil" }
+```
+Queima o texto (marca) no rodapé do vídeo via ffmpeg `drawtext` (`text` é opcional, default "Fica ON Brasil"). Retorna `watermarked.mp4`.
+
 ## Deploy no EasyPanel (mesma stack/projeto do n8n)
 1. EasyPanel → projeto onde está o n8n → **+ Create Service** → **App**.
 2. Nome do serviço: **ffmpeg-slideshow** (esse nome vira o host interno).

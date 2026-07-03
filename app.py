@@ -131,5 +131,51 @@ def concat():
         shutil.rmtree(work, ignore_errors=True)
 
 
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+@app.route("/watermark", methods=["POST"])
+def watermark():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    video_url = data.get("video")
+    text = str(data.get("text") or "Fica ON Brasil")
+    if not video_url or not isinstance(video_url, str) or not video_url.startswith("http"):
+        return jsonify({"error": "need a video URL"}), 400
+
+    # escapa aspas simples e dois-pontos, que quebram a sintaxe do filtro drawtext
+    safe_text = text.replace("\\", "").replace("'", "").replace(":", "\\:")
+
+    work = tempfile.mkdtemp()
+    try:
+        src = os.path.join(work, "in.mp4")
+        fetch(video_url, src)
+        out = os.path.join(work, "watermarked.mp4")
+
+        drawtext = (
+            "drawtext=fontfile=%s:text='%s':fontsize=42:fontcolor=white@0.92:"
+            "box=1:boxcolor=black@0.45:boxborderw=16:x=(w-text_w)/2:y=h-th-60"
+            % (FONT_PATH, safe_text)
+        )
+
+        cmd = [
+            "ffmpeg", "-y", "-i", src,
+            "-vf", drawtext,
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-movflags", "+faststart", out,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="watermarked.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
