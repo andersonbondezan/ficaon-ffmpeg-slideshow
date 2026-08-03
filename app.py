@@ -4,6 +4,7 @@ import tempfile
 import shutil
 import urllib.request
 from flask import Flask, request, send_file, jsonify
+import yt_dlp
 
 app = Flask(__name__)
 TOKEN = os.environ.get("SLIDESHOW_TOKEN", "ugc_slideshow_7yKp29Qm")
@@ -176,6 +177,106 @@ def watermark():
             return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
 
         return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="watermarked.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.route("/tiktok/hashtag", methods=["POST"])
+def tiktok_hashtag():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    hashtag = str(data.get("hashtag") or "").strip().lstrip("#")
+    limit = int(data.get("limit") or 10)
+    limit = max(1, min(limit, 30))
+    if not hashtag:
+        return jsonify({"error": "missing hashtag"}), 400
+
+    url = "https://www.tiktok.com/tag/%s" % hashtag
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "playlistend": limit,
+        "socket_timeout": 30,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        entries = (info or {}).get("entries") or []
+        results = []
+        for e in entries[:limit]:
+            if not e:
+                continue
+            results.append({
+                "id": e.get("id"),
+                "url": e.get("webpage_url") or e.get("url"),
+                "description": e.get("description") or e.get("title") or "",
+                "view_count": e.get("view_count"),
+                "like_count": e.get("like_count"),
+                "duration": e.get("duration"),
+                "cover_url": e.get("thumbnail"),
+                "timestamp": e.get("timestamp"),
+                "uploader": e.get("uploader") or e.get("channel"),
+            })
+        return jsonify({"hashtag": hashtag, "results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tiktok/video", methods=["POST"])
+def tiktok_video():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    video_url = str(data.get("url") or "").strip()
+    if not video_url:
+        return jsonify({"error": "missing url"}), 400
+
+    work = tempfile.mkdtemp()
+    try:
+        out_tmpl = os.path.join(work, "video.%(ext)s")
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": out_tmpl,
+            "format": "mp4/best",
+            "socket_timeout": 60,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        files = [f for f in os.listdir(work) if f.startswith("video.")]
+        if not files:
+            return jsonify({"error": "download produced no file"}), 500
+        out = os.path.join(work, files[0])
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="tiktok.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.route("/tiktok/cover", methods=["POST"])
+def tiktok_cover():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    cover_url = str(data.get("url") or "").strip()
+    if not cover_url or not cover_url.startswith("http"):
+        return jsonify({"error": "missing url"}), 400
+
+    work = tempfile.mkdtemp()
+    try:
+        out = os.path.join(work, "cover.jpg")
+        fetch(cover_url, out)
+        return send_file(out, mimetype="image/jpeg", as_attachment=True, download_name="cover.jpg")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:

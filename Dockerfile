@@ -6,7 +6,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY app.py .
-RUN pip install --no-cache-dir flask gunicorn
+RUN pip install --no-cache-dir flask gunicorn yt-dlp
 
 EXPOSE 8080
 # 1 worker, timeout alto (geração de vídeo pode levar dezenas de segundos)
