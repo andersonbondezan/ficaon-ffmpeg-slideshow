@@ -29,6 +29,7 @@ def slideshow():
     data = request.get_json(force=True, silent=True) or {}
     images = data.get("images") or []
     secs = float(data.get("seconds_each", 3))
+    audio_url = data.get("audioUrl")
     images = [u for u in images if isinstance(u, str) and u.startswith("http")][:10]
     if len(images) < 2:
         return jsonify({"error": "need at least 2 image URLs"}), 400
@@ -42,12 +43,33 @@ def slideshow():
             paths.append(p)
 
         out = os.path.join(work, "reel.mp4")
+
+        # Se veio audioUrl, baixa o áudio de verdade e usa a duração real dele
+        # pra dividir entre as imagens - assim a narração nunca é cortada.
+        audio_path = None
+        if audio_url and isinstance(audio_url, str) and audio_url.startswith("http"):
+            audio_path = os.path.join(work, "audio.in")
+            fetch(audio_url, audio_path)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            try:
+                audio_duration = float(probe.stdout.strip())
+            except (ValueError, TypeError):
+                audio_duration = None
+            if audio_duration and audio_duration > 0:
+                secs = audio_duration / len(paths)
+
         total = secs * len(paths)
 
         inputs = []
         for p in paths:
             inputs += ["-loop", "1", "-t", str(secs), "-i", p]
-        inputs += ["-f", "lavfi", "-t", str(total), "-i", "anullsrc=r=44100:cl=stereo"]
+        if audio_path:
+            inputs += ["-i", audio_path]
+        else:
+            inputs += ["-f", "lavfi", "-t", str(total), "-i", "anullsrc=r=44100:cl=stereo"]
 
         parts = []
         for i in range(len(paths)):
