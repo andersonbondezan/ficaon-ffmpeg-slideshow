@@ -157,6 +157,37 @@ def concat():
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
+def _wrap_text(text, max_chars):
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        candidate = (cur + " " + w).strip()
+        if len(candidate) <= max_chars or not cur:
+            cur = candidate
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _fit_watermark_text(text):
+    # Escolhe fonte + quebra de linha pra caber em 1080px de largura sem cortar,
+    # não importa o tamanho do texto recebido (hook variavel + sufixo de marca).
+    for fontsize, max_chars in ((42, 30), (34, 36), (26, 42)):
+        lines = _wrap_text(text, max_chars)
+        if len(lines) <= 3:
+            return fontsize, lines
+    # texto extremo: força 3 linhas na menor fonte, truncando o resto
+    fontsize, max_chars = 26, 42
+    lines = _wrap_text(text, max_chars)[:3]
+    if lines:
+        lines[-1] = lines[-1][: max_chars - 1] + "…"
+    return fontsize, lines
+
+
 @app.route("/watermark", methods=["POST"])
 def watermark():
     if request.headers.get("x-token") != TOKEN:
@@ -166,8 +197,10 @@ def watermark():
     video_url = data.get("video")
     text = str(data.get("text") or request.args.get("text") or "Fica ON Brasil")
 
-    # escapa aspas simples e dois-pontos, que quebram a sintaxe do filtro drawtext
-    safe_text = text.replace("\\", "").replace("'", "").replace(":", "\\:")
+    fontsize, lines = _fit_watermark_text(text)
+    # escapa aspas simples e dois-pontos (quebram a sintaxe do filtro drawtext) linha a linha
+    safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+    safe_text = "\n".join(safe_lines)
 
     work = tempfile.mkdtemp()
     try:
@@ -183,9 +216,9 @@ def watermark():
         out = os.path.join(work, "watermarked.mp4")
 
         drawtext = (
-            "drawtext=fontfile=%s:text='%s':fontsize=42:fontcolor=white@0.92:"
-            "box=1:boxcolor=black@0.45:boxborderw=16:x=(w-text_w)/2:y=h-th-60"
-            % (FONT_PATH, safe_text)
+            "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=white@0.92:"
+            "line_spacing=8:box=1:boxcolor=black@0.45:boxborderw=16:x=(w-text_w)/2:y=h-th-60"
+            % (FONT_PATH, safe_text, fontsize)
         )
 
         cmd = [
