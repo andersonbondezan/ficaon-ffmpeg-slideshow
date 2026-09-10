@@ -1,0 +1,4 @@
+Coloque aqui clipes .mp4 curtos (20-60s, livres de direitos autorais - Pexels/Pixabay) para
+servirem de fundo dos vídeos do endpoint /longform. O endpoint escolhe um aleatoriamente a cada
+chamada. Sem nenhum arquivo aqui, ele usa um fundo de cor sólida como fallback (só pra manter o
+pipeline testável).

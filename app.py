@@ -2,12 +2,18 @@ import os
 import subprocess
 import tempfile
 import shutil
+import glob
+import random
+import asyncio
 import urllib.request
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
+import edge_tts
 
 app = Flask(__name__)
 TOKEN = os.environ.get("SLIDESHOW_TOKEN", "ugc_slideshow_7yKp29Qm")
+BACKGROUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backgrounds")
+DEFAULT_VOICE = "pt-BR-AntonioNeural"
 
 
 def fetch(url, path):
@@ -332,6 +338,140 @@ def tiktok_cover():
         out = os.path.join(work, "cover.jpg")
         fetch(cover_url, out)
         return send_file(out, mimetype="image/jpeg", as_attachment=True, download_name="cover.jpg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _pick_background():
+    clips = glob.glob(os.path.join(BACKGROUNDS_DIR, "*.mp4"))
+    return random.choice(clips) if clips else None
+
+
+def _srt_timestamp(seconds):
+    ms_total = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(ms_total, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+
+
+def _synthesize_with_captions(text, voice, audio_path, srt_path):
+    # WordBoundary offset/duration do edge-tts vêm em unidades de 100ns.
+    words = []
+
+    async def run():
+        communicate = edge_tts.Communicate(text, voice)
+        with open(audio_path, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    words.append({
+                        "start": chunk["offset"] / 10_000_000,
+                        "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
+                        "text": chunk["text"],
+                    })
+
+    asyncio.run(run())
+
+    if not words:
+        # sem word boundaries (pode acontecer em vozes/versões específicas) -
+        # ainda assim gera o áudio; legenda fica vazia, video sai sem captions.
+        open(srt_path, "w", encoding="utf-8").close()
+        return
+
+    # agrupa palavras em blocos de legenda (~8 palavras ou ~4s, o que vier primeiro)
+    groups = []
+    cur = []
+    cur_start = words[0]["start"]
+    for w in words:
+        if cur and (len(cur) >= 8 or (w["end"] - cur_start) > 4.0):
+            groups.append((cur_start, cur[-1]["end"], cur))
+            cur = []
+            cur_start = w["start"]
+        cur.append(w)
+    if cur:
+        groups.append((cur_start, cur[-1]["end"], cur))
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, ws) in enumerate(groups, 1):
+            line = " ".join(w["text"] for w in ws)
+            f.write("%d\n%s --> %s\n%s\n\n" % (i, _srt_timestamp(start), _srt_timestamp(end), line))
+
+
+@app.route("/longform", methods=["POST"])
+def longform():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    texto = str(data.get("texto") or "").strip()
+    voice = str(data.get("voice") or DEFAULT_VOICE)
+    if len(texto) < 20:
+        return jsonify({"error": "texto muito curto ou ausente"}), 400
+
+    work = tempfile.mkdtemp()
+    try:
+        audio_path = os.path.join(work, "narracao.mp3")
+        srt_path = os.path.join(work, "captions.srt")
+        _synthesize_with_captions(texto, voice, audio_path, srt_path)
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        try:
+            duration = float(probe.stdout.strip())
+        except (ValueError, TypeError):
+            duration = None
+        if not duration or duration <= 0:
+            return jsonify({"error": "falha ao medir duração da narração"}), 500
+
+        bg_path = _pick_background()
+        out = os.path.join(work, "longform.mp4")
+
+        has_captions = os.path.getsize(srt_path) > 0
+        srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+        vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
+        if has_captions:
+            vf_parts.append(
+                "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=70'" % srt_escaped
+            )
+        vf = ",".join(vf_parts)
+
+        if bg_path:
+            cmd = [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", bg_path,
+                "-i", audio_path,
+                "-vf", vf,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
+            ]
+        else:
+            # sem clipe de fundo cadastrado ainda (backgrounds/ vazio) - fallback
+            # de cor sólida só pra manter o pipeline testável ponta a ponta.
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=30",
+                "-i", audio_path,
+                "-vf", vf,
+                "-map", "0:v", "-map", "1:a",
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
+            ]
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-2000:]}), 500
+
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="longform.mp4")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
