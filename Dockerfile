@@ -7,7 +7,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY app.py .
 COPY backgrounds/ backgrounds/
-RUN pip install --no-cache-dir flask gunicorn yt-dlp edge-tts==6.1.19
+RUN pip install --no-cache-dir flask gunicorn yt-dlp edge-tts==7.2.8
 
 EXPOSE 8080
 # 1 worker, timeout alto (/longform gera TTS + renderiza vídeo longo, pode levar minutos)

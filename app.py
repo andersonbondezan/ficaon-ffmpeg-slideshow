@@ -4,7 +4,6 @@ import tempfile
 import shutil
 import glob
 import random
-import asyncio
 import urllib.request
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
@@ -360,21 +359,17 @@ def _srt_timestamp(seconds):
 def _synthesize_with_captions(text, voice, audio_path, srt_path):
     # WordBoundary offset/duration do edge-tts vêm em unidades de 100ns.
     words = []
-
-    async def run():
-        communicate = edge_tts.Communicate(text, voice)
-        with open(audio_path, "wb") as f:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    words.append({
-                        "start": chunk["offset"] / 10_000_000,
-                        "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
-                        "text": chunk["text"],
-                    })
-
-    asyncio.run(run())
+    communicate = edge_tts.Communicate(text, voice)
+    with open(audio_path, "wb") as f:
+        for chunk in communicate.stream_sync():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                words.append({
+                    "start": chunk["offset"] / 10_000_000,
+                    "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
+                    "text": chunk["text"],
+                })
 
     if not words:
         # sem word boundaries (pode acontecer em vozes/versões específicas) -
