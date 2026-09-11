@@ -10,5 +10,6 @@ COPY backgrounds/ backgrounds/
 RUN pip install --no-cache-dir flask gunicorn yt-dlp edge-tts==7.2.8
 
 EXPOSE 8080
-# 1 worker, timeout alto (/longform gera TTS + renderiza vídeo longo, pode levar minutos)
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "1", "-t", "900", "app:app"]
+# 1 worker, timeout bem alto (/longform agora gera 5 historias longas por video,
+# 800+ palavras cada - TTS + render de ~25min de video pode passar de 20min)
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "-w", "1", "-t", "2700", "app:app"]
