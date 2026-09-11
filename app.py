@@ -438,10 +438,10 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
     _write_srt(_group_words(words), srt_path)
 
 
-def _render_segment(texto, voice, image_path, out_path, fps=30):
-    # Renderiza 1 trecho isolado: narracao + legenda queimada sobre a imagem
-    # (ou cor solida de fallback) daquele trecho, com Ken Burns pela duracao
-    # real do audio desse trecho.
+def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True):
+    # Renderiza 1 trecho isolado: narracao (+ legenda queimada, opcional) sobre
+    # a imagem (ou cor solida de fallback) daquele trecho, com Ken Burns pela
+    # duracao real do audio desse trecho.
     work = os.path.dirname(out_path)
     tag = os.path.splitext(os.path.basename(out_path))[0]
     audio_path = os.path.join(work, "%s_audio.mp3" % tag)
@@ -459,7 +459,7 @@ def _render_segment(texto, voice, image_path, out_path, fps=30):
     if not duration or duration <= 0:
         raise RuntimeError("falha ao medir duração da narração do trecho")
 
-    has_captions = os.path.getsize(srt_path) > 0
+    has_captions = burn_captions and os.path.getsize(srt_path) > 0
     srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
     subtitles_filter = (
         "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
@@ -497,6 +497,56 @@ def _render_segment(texto, voice, image_path, out_path, fps=30):
         raise RuntimeError("ffmpeg failed: %s" % res.stderr[-1500:])
 
 
+def _fit_title_card_text(titulo):
+    titulo = titulo.upper()
+    for fontsize, max_chars in ((72, 22), (58, 28), (46, 34)):
+        lines = _wrap_text(titulo, max_chars)
+        if len(lines) <= 3:
+            return fontsize, lines
+    fontsize, max_chars = 46, 34
+    return fontsize, _wrap_text(titulo, max_chars)[:3]
+
+
+def _render_title_card(numero, titulo, image_path, out_path, duration=3.0, fps=30):
+    # Placa de transicao entre historias: numero grande + titulo da historia,
+    # sobre a mesma imagem daquele trecho (ou cor solida de fallback).
+    fontsize, lines = _fit_title_card_text(titulo)
+    safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+    safe_titulo = "\n".join(safe_lines)
+    numero_text = "HISTORIA %d" % numero
+
+    drawtext_num = (
+        "drawtext=fontfile=%s:text='%s':fontsize=110:fontcolor=0xFFD400:"
+        "borderw=8:bordercolor=black:box=1:boxcolor=black@0.5:boxborderw=24:"
+        "x=(w-text_w)/2:y=(h/2)-190"
+        % (FONT_PATH, numero_text)
+    )
+    drawtext_titulo = (
+        "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=white:"
+        "borderw=6:bordercolor=black:line_spacing=12:box=1:boxcolor=black@0.5:boxborderw=24:"
+        "x=(w-text_w)/2:y=(h/2)+10"
+        % (FONT_PATH, safe_titulo, fontsize)
+    )
+    vf = "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080," + drawtext_num + "," + drawtext_titulo
+
+    inputs = []
+    if image_path:
+        inputs += ["-loop", "1", "-t", str(duration), "-i", image_path]
+    else:
+        inputs += ["-f", "lavfi", "-t", str(duration), "-i", "color=c=0x14141f:s=1920x1080:r=%d" % fps]
+    inputs += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=r=44100:cl=stereo"]
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-vf", vf,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg failed (title card): %s" % res.stderr[-1500:])
+
+
 @app.route("/longform", methods=["POST"])
 def longform():
     if request.headers.get("x-token") != TOKEN:
@@ -513,19 +563,30 @@ def longform():
         if isinstance(segmentos, list) and segmentos:
             # 1 imagem por trecho narrado (gerada por IA a partir do prompt_imagem
             # de cada historia) em vez de 1 imagem estatica pro video inteiro.
+            # Cada historia e precedida por uma placa de transicao (numero + titulo),
+            # sem legenda queimada (so a placa marca a mudanca de historia).
             seg_paths = []
+            numero = 0
             for i, seg in enumerate(segmentos):
                 seg_texto = str((seg or {}).get("texto") or "").strip()
                 if len(seg_texto) < 5:
                     continue
+                numero += 1
                 img_url = (seg or {}).get("imageUrl") or (seg or {}).get("image_url")
                 if img_url and isinstance(img_url, str) and img_url.startswith("http"):
                     image_path = os.path.join(work, "seg%d_img" % i)
                     fetch(img_url, image_path)
                 else:
                     image_path = _pick_background_image()
+
+                titulo_historia = str((seg or {}).get("titulo") or (seg or {}).get("titulo_historia") or "").strip()
+                if titulo_historia:
+                    card_out = os.path.join(work, "seg%d_card.mp4" % i)
+                    _render_title_card(numero, titulo_historia, image_path, card_out)
+                    seg_paths.append(card_out)
+
                 seg_out = os.path.join(work, "seg%d.mp4" % i)
-                _render_segment(seg_texto, voice, image_path, seg_out)
+                _render_segment(seg_texto, voice, image_path, seg_out, burn_captions=False)
                 seg_paths.append(seg_out)
             if not seg_paths:
                 return jsonify({"error": "nenhum segmento valido recebido"}), 400
