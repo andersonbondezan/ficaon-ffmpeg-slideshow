@@ -358,7 +358,7 @@ def _srt_timestamp(seconds):
     return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
 
 
-def _synthesize_with_captions(text, voice, audio_path, srt_path):
+def _synthesize_once(text, voice, audio_path):
     # WordBoundary offset/duration do edge-tts vêm em unidades de 100ns.
     words = []
     communicate = edge_tts.Communicate(text, voice)
@@ -372,13 +372,17 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
                     "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
                     "text": chunk["text"],
                 })
+    return words
 
-    if not words:
-        # sem word boundaries (pode acontecer em vozes/versões específicas) -
-        # ainda assim gera o áudio; legenda fica vazia, video sai sem captions.
-        open(srt_path, "w", encoding="utf-8").close()
-        return
 
+def _write_srt(groups, srt_path):
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, ws) in enumerate(groups, 1):
+            line = " ".join(w["text"] for w in ws)
+            f.write("%d\n%s --> %s\n%s\n\n" % (i, _srt_timestamp(start), _srt_timestamp(end), line))
+
+
+def _group_words(words):
     # agrupa palavras em blocos de legenda (~8 palavras ou ~4s, o que vier primeiro)
     groups = []
     cur = []
@@ -391,11 +395,44 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
         cur.append(w)
     if cur:
         groups.append((cur_start, cur[-1]["end"], cur))
+    return groups
 
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (start, end, ws) in enumerate(groups, 1):
-            line = " ".join(w["text"] for w in ws)
-            f.write("%d\n%s --> %s\n%s\n\n" % (i, _srt_timestamp(start), _srt_timestamp(end), line))
+
+def _fallback_words_by_duration(text, audio_path):
+    # edge-tts as vezes nao devolve WordBoundary nenhum (falha intermitente do
+    # servico da Microsoft, nao do nosso codigo) - em vez de deixar a legenda
+    # vazia, distribui as palavras uniformemente pela duracao real do audio.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except (ValueError, TypeError):
+        duration = None
+    tokens = text.split()
+    if not duration or duration <= 0 or not tokens:
+        return []
+    per_word = duration / len(tokens)
+    words = []
+    for i, tok in enumerate(tokens):
+        words.append({"start": i * per_word, "end": (i + 1) * per_word, "text": tok})
+    return words
+
+
+def _synthesize_with_captions(text, voice, audio_path, srt_path):
+    words = _synthesize_once(text, voice, audio_path)
+    if not words:
+        # falha intermitente conhecida do edge-tts - tenta de novo antes de desistir
+        words = _synthesize_once(text, voice, audio_path)
+    if not words:
+        # ainda sem boundaries: gera legenda com timing aproximado em vez de
+        # deixar o video sair sem captions nenhuma.
+        words = _fallback_words_by_duration(text, audio_path)
+    if not words:
+        open(srt_path, "w", encoding="utf-8").close()
+        return
+    _write_srt(_group_words(words), srt_path)
 
 
 @app.route("/longform", methods=["POST"])
