@@ -104,6 +104,35 @@ def slideshow():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _concat_mp4s(paths, out_path, width=1080, height=1920, timeout=600):
+    # Re-encode each clip pro mesmo formato (resolucao/fps/audio) e concatena
+    # preservando audio. Robusto mesmo se os clipes vierem levemente diferentes.
+    inputs = []
+    for p in paths:
+        inputs += ["-i", p]
+
+    parts = []
+    for i in range(len(paths)):
+        parts.append(
+            "[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,"
+            "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v%d];"
+            "[%d:a]aresample=44100,aformat=channel_layouts=stereo[a%d]"
+            % (i, width, height, width, height, i, i, i)
+        )
+    concat_in = "".join("[v%d][a%d]" % (i, i) for i in range(len(paths)))
+    filt = ";".join(parts) + ";%sconcat=n=%d:v=1:a=1[v][a]" % (concat_in, len(paths))
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", filt,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if res.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg concat failed: %s" % res.stderr[-1500:])
+
+
 @app.route("/concat", methods=["POST"])
 def concat():
     if request.headers.get("x-token") != TOKEN:
@@ -124,33 +153,7 @@ def concat():
             paths.append(p)
 
         out = os.path.join(work, "final.mp4")
-
-        # Re-encode each clip to a common format (1080x1920, 30fps, stereo 44.1k)
-        # and concat preserving audio. Robust even if clips differ slightly.
-        inputs = []
-        for p in paths:
-            inputs += ["-i", p]
-
-        parts = []
-        for i in range(len(paths)):
-            parts.append(
-                "[%d:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p[v%d];"
-                "[%d:a]aresample=44100,aformat=channel_layouts=stereo[a%d]"
-                % (i, i, i, i)
-            )
-        concat_in = "".join("[v%d][a%d]" % (i, i) for i in range(len(paths)))
-        filt = ";".join(parts) + ";%sconcat=n=%d:v=1:a=1[v][a]" % (concat_in, len(paths))
-
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-filter_complex", filt,
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if res.returncode != 0 or not os.path.exists(out):
-            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+        _concat_mp4s(paths, out, width=1080, height=1920, timeout=600)
 
         return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="final.mp4")
     except Exception as e:
@@ -435,87 +438,108 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
     _write_srt(_group_words(words), srt_path)
 
 
+def _render_segment(texto, voice, image_path, out_path, fps=30):
+    # Renderiza 1 trecho isolado: narracao + legenda queimada sobre a imagem
+    # (ou cor solida de fallback) daquele trecho, com Ken Burns pela duracao
+    # real do audio desse trecho.
+    work = os.path.dirname(out_path)
+    tag = os.path.splitext(os.path.basename(out_path))[0]
+    audio_path = os.path.join(work, "%s_audio.mp3" % tag)
+    srt_path = os.path.join(work, "%s_captions.srt" % tag)
+    _synthesize_with_captions(texto, voice, audio_path, srt_path)
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except (ValueError, TypeError):
+        duration = None
+    if not duration or duration <= 0:
+        raise RuntimeError("falha ao medir duração da narração do trecho")
+
+    has_captions = os.path.getsize(srt_path) > 0
+    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+    subtitles_filter = (
+        "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=70'" % srt_escaped
+    ) if has_captions else None
+
+    if image_path:
+        # imagem estatica (gerada por IA ou do banco de fundos) com zoom lento
+        # continuo (efeito Ken Burns) pela duracao do audio desse trecho.
+        total_frames = max(1, int(round(duration * fps)))
+        vf_parts = [
+            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+            "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=1920x1080:fps=%d" % (total_frames, fps),
+        ]
+        src_input = ["-loop", "1", "-i", image_path]
+    else:
+        # sem nenhuma imagem disponivel - fallback de cor solida pra manter o
+        # pipeline testavel ponta a ponta.
+        vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
+        src_input = ["-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=%d" % fps]
+    if subtitles_filter:
+        vf_parts.append(subtitles_filter)
+    vf = ",".join(vf_parts)
+
+    cmd = ["ffmpeg", "-y"] + src_input + [
+        "-i", audio_path,
+        "-vf", vf,
+        "-map", "0:v", "-map", "1:a",
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if res.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg failed: %s" % res.stderr[-1500:])
+
+
 @app.route("/longform", methods=["POST"])
 def longform():
     if request.headers.get("x-token") != TOKEN:
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(force=True, silent=True) or {}
-    texto = str(data.get("texto") or "").strip()
     voice = str(data.get("voice") or DEFAULT_VOICE)
-    if len(texto) < 20:
-        return jsonify({"error": "texto muito curto ou ausente"}), 400
+    segmentos = data.get("segmentos")
 
     work = tempfile.mkdtemp()
     try:
-        audio_path = os.path.join(work, "narracao.mp3")
-        srt_path = os.path.join(work, "captions.srt")
-        _synthesize_with_captions(texto, voice, audio_path, srt_path)
-
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        try:
-            duration = float(probe.stdout.strip())
-        except (ValueError, TypeError):
-            duration = None
-        if not duration or duration <= 0:
-            return jsonify({"error": "falha ao medir duração da narração"}), 500
-
-        bg_path = _pick_background_image()
         out = os.path.join(work, "longform.mp4")
-        fps = 30
 
-        has_captions = os.path.getsize(srt_path) > 0
-        srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
-        subtitles_filter = (
-            "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
-            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=70'" % srt_escaped
-        ) if has_captions else None
-
-        if bg_path:
-            # imagem estatica gerada por IA (fal.ai) com zoom lento continuo (efeito Ken Burns)
-            # pela duracao inteira do audio - visual bem mais vivo que fundo parado.
-            total_frames = max(1, int(round(duration * fps)))
-            vf_parts = [
-                "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
-                "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=1920x1080:fps=%d" % (total_frames, fps),
-            ]
-            if subtitles_filter:
-                vf_parts.append(subtitles_filter)
-            vf = ",".join(vf_parts)
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", bg_path,
-                "-i", audio_path,
-                "-vf", vf,
-                "-map", "0:v", "-map", "1:a",
-                "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
-                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
-            ]
+        if isinstance(segmentos, list) and segmentos:
+            # 1 imagem por trecho narrado (gerada por IA a partir do prompt_imagem
+            # de cada historia) em vez de 1 imagem estatica pro video inteiro.
+            seg_paths = []
+            for i, seg in enumerate(segmentos):
+                seg_texto = str((seg or {}).get("texto") or "").strip()
+                if len(seg_texto) < 5:
+                    continue
+                img_url = (seg or {}).get("imageUrl") or (seg or {}).get("image_url")
+                if img_url and isinstance(img_url, str) and img_url.startswith("http"):
+                    image_path = os.path.join(work, "seg%d_img" % i)
+                    fetch(img_url, image_path)
+                else:
+                    image_path = _pick_background_image()
+                seg_out = os.path.join(work, "seg%d.mp4" % i)
+                _render_segment(seg_texto, voice, image_path, seg_out)
+                seg_paths.append(seg_out)
+            if not seg_paths:
+                return jsonify({"error": "nenhum segmento valido recebido"}), 400
+            if len(seg_paths) == 1:
+                shutil.copy(seg_paths[0], out)
+            else:
+                _concat_mp4s(seg_paths, out, width=1920, height=1080, timeout=600)
         else:
-            # sem nenhuma imagem cadastrada ainda em backgrounds/images/ - fallback
-            # de cor sólida só pra manter o pipeline testável ponta a ponta.
-            vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
-            if subtitles_filter:
-                vf_parts.append(subtitles_filter)
-            vf = ",".join(vf_parts)
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=%d" % fps,
-                "-i", audio_path,
-                "-vf", vf,
-                "-map", "0:v", "-map", "1:a",
-                "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
-                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
-            ]
-
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if res.returncode != 0 or not os.path.exists(out):
-            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-2000:]}), 500
+            # modo legado: 1 texto corrido so, 1 imagem estatica pro video inteiro.
+            texto = str(data.get("texto") or "").strip()
+            if len(texto) < 20:
+                return jsonify({"error": "texto muito curto ou ausente"}), 400
+            bg_path = _pick_background_image()
+            _render_segment(texto, voice, bg_path, out)
 
         return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="longform.mp4")
     except Exception as e:
