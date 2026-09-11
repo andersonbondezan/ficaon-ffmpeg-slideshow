@@ -618,6 +618,81 @@ def thumbnail():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _fit_banner_text(text):
+    # Texto grande centralizado pra capa de canal 2560x1440 - posicionado na
+    # faixa central "safe area" que fica visivel em qualquer dispositivo.
+    text = text.upper()
+    for fontsize, max_chars in ((140, 18), (110, 24), (86, 30)):
+        lines = _wrap_text(text, max_chars)
+        if len(lines) <= 2:
+            return fontsize, lines
+    fontsize, max_chars = 86, 30
+    return fontsize, _wrap_text(text, max_chars)[:2]
+
+
+@app.route("/banner", methods=["POST"])
+def banner():
+    # Gera uma capa de canal 2560x1440 (padrao YouTube) a partir de uma imagem
+    # de fundo + texto grande centralizado na "safe area" (faixa central que
+    # aparece em qualquer dispositivo: desktop, mobile, TV).
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    image_url = data.get("imageUrl") or data.get("image_url")
+    text = str(data.get("texto") or "").strip()
+    subtext = str(data.get("subtexto") or "").strip()
+    if not text and not image_url:
+        return jsonify({"error": "precisa de imageUrl e/ou texto"}), 400
+
+    drawtext_parts = []
+    if text:
+        fontsize, lines = _fit_banner_text(text)
+        safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+        safe_text = "\n".join(safe_lines)
+        y_expr = "(h-text_h)/2-40" if subtext else "(h-text_h)/2"
+        drawtext_parts.append(
+            "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=white:"
+            "borderw=8:bordercolor=black:line_spacing=10:x=(w-text_w)/2:y=%s"
+            % (FONT_PATH, safe_text, fontsize, y_expr)
+        )
+    if subtext:
+        sub_safe = subtext.replace("\\", "").replace("'", "").replace(":", "\\:")
+        drawtext_parts.append(
+            "drawtext=fontfile=%s:text='%s':fontsize=44:fontcolor=white:"
+            "borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h/2)+90"
+            % (FONT_PATH, sub_safe)
+        )
+
+    work = tempfile.mkdtemp()
+    try:
+        src = None
+        if image_url and isinstance(image_url, str) and image_url.startswith("http"):
+            src = os.path.join(work, "in_img")
+            fetch(image_url, src)
+        out = os.path.join(work, "banner.jpg")
+
+        if src:
+            vf = "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440"
+            if drawtext_parts:
+                vf += "," + ",".join(drawtext_parts)
+            cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", "1", "-q:v", "2", out]
+        else:
+            vf = ",".join(drawtext_parts) if drawtext_parts else "null"
+            cmd = [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x14141f:s=2560x1440",
+                "-vf", vf, "-frames:v", "1", "-q:v", "2", out,
+            ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+        return send_file(out, mimetype="image/jpeg", as_attachment=True, download_name="banner.jpg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.route("/debug/frame", methods=["POST"])
 def debug_frame():
     # utilitario de debug: extrai 1 frame de um video (URL ou binario cru) em
