@@ -343,9 +343,11 @@ def tiktok_cover():
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _pick_background():
-    clips = glob.glob(os.path.join(BACKGROUNDS_DIR, "*.mp4"))
-    return random.choice(clips) if clips else None
+def _pick_background_image():
+    imgs = glob.glob(os.path.join(BACKGROUNDS_DIR, "images", "*.jpg"))
+    imgs += glob.glob(os.path.join(BACKGROUNDS_DIR, "images", "*.jpeg"))
+    imgs += glob.glob(os.path.join(BACKGROUNDS_DIR, "images", "*.png"))
+    return random.choice(imgs) if imgs else None
 
 
 def _srt_timestamp(seconds):
@@ -424,41 +426,53 @@ def longform():
         if not duration or duration <= 0:
             return jsonify({"error": "falha ao medir duração da narração"}), 500
 
-        bg_path = _pick_background()
+        bg_path = _pick_background_image()
         out = os.path.join(work, "longform.mp4")
+        fps = 30
 
         has_captions = os.path.getsize(srt_path) > 0
         srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
-        vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
-        if has_captions:
-            vf_parts.append(
-                "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=70'" % srt_escaped
-            )
-        vf = ",".join(vf_parts)
+        subtitles_filter = (
+            "subtitles=%s:force_style='FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=70'" % srt_escaped
+        ) if has_captions else None
 
         if bg_path:
+            # imagem estatica gerada por IA (fal.ai) com zoom lento continuo (efeito Ken Burns)
+            # pela duracao inteira do audio - visual bem mais vivo que fundo parado.
+            total_frames = max(1, int(round(duration * fps)))
+            vf_parts = [
+                "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+                "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=1920x1080:fps=%d" % (total_frames, fps),
+            ]
+            if subtitles_filter:
+                vf_parts.append(subtitles_filter)
+            vf = ",".join(vf_parts)
             cmd = [
                 "ffmpeg", "-y",
-                "-stream_loop", "-1", "-i", bg_path,
+                "-loop", "1", "-i", bg_path,
                 "-i", audio_path,
                 "-vf", vf,
                 "-map", "0:v", "-map", "1:a",
                 "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
                 "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
             ]
         else:
-            # sem clipe de fundo cadastrado ainda (backgrounds/ vazio) - fallback
+            # sem nenhuma imagem cadastrada ainda em backgrounds/images/ - fallback
             # de cor sólida só pra manter o pipeline testável ponta a ponta.
+            vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
+            if subtitles_filter:
+                vf_parts.append(subtitles_filter)
+            vf = ",".join(vf_parts)
             cmd = [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=30",
+                "-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=%d" % fps,
                 "-i", audio_path,
                 "-vf", vf,
                 "-map", "0:v", "-map", "1:a",
                 "-t", str(duration),
-                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
                 "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
             ]
 

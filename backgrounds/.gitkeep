@@ -1,4 +1,4 @@
-Coloque aqui clipes .mp4 curtos (20-60s, livres de direitos autorais - Pexels/Pixabay) para
-servirem de fundo dos vídeos do endpoint /longform. O endpoint escolhe um aleatoriamente a cada
-chamada. Sem nenhum arquivo aqui, ele usa um fundo de cor sólida como fallback (só pra manter o
-pipeline testável).
+Fundos do endpoint /longform agora ficam em backgrounds/images/ (imagens estaticas .jpg/.png,
+geradas via fal.ai, animadas com zoom lento - efeito Ken Burns - direto no ffmpeg). Pra trocar o
+lote, so substituir os arquivos dessa pasta e fazer novo deploy. Sem nenhuma imagem, o /longform
+cai no fallback de cor solida.
