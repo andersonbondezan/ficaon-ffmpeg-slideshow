@@ -572,12 +572,20 @@ def thumbnail():
     data = request.get_json(force=True, silent=True) or {}
     image_url = data.get("imageUrl") or data.get("image_url")
     text = str(data.get("texto") or "").strip()
-    if not text:
-        return jsonify({"error": "texto ausente"}), 400
+    if not text and not image_url:
+        return jsonify({"error": "precisa de imageUrl e/ou texto"}), 400
 
-    fontsize, lines = _fit_thumbnail_text(text)
-    safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
-    safe_text = "\n".join(safe_lines)
+    drawtext = None
+    if text:
+        fontsize, lines = _fit_thumbnail_text(text)
+        safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+        safe_text = "\n".join(safe_lines)
+        drawtext = (
+            "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=0xFFD400:"
+            "borderw=6:bordercolor=black:line_spacing=14:"
+            "box=1:boxcolor=black@0.35:boxborderw=24:x=(w-text_w)/2:y=h-th-70"
+            % (FONT_PATH, safe_text, fontsize)
+        )
 
     work = tempfile.mkdtemp()
     try:
@@ -587,20 +595,14 @@ def thumbnail():
             fetch(image_url, src)
         out = os.path.join(work, "thumbnail.jpg")
 
-        drawtext = (
-            "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=0xFFD400:"
-            "borderw=6:bordercolor=black:line_spacing=14:"
-            "box=1:boxcolor=black@0.35:boxborderw=24:x=(w-text_w)/2:y=h-th-70"
-            % (FONT_PATH, safe_text, fontsize)
-        )
-
         if src:
-            cmd = [
-                "ffmpeg", "-y", "-i", src,
-                "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720," + drawtext,
-                "-frames:v", "1", "-q:v", "2", out,
-            ]
+            vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720"
+            if drawtext:
+                vf += "," + drawtext
+            cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", "1", "-q:v", "2", out]
         else:
+            # sem imagem nenhuma - fallback de cor solida (só acontece se nao veio
+            # imageUrl nenhuma; sempre tem texto nesse caso, ja validado acima)
             cmd = [
                 "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x14141f:s=1280x720",
                 "-vf", drawtext,
