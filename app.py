@@ -548,6 +548,74 @@ def longform():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _fit_thumbnail_text(text):
+    # Texto grande e chamativo pra capa 1280x720 - fonte bem maior que a do
+    # watermark, tudo em maiusculas pra maximo impacto visual.
+    text = text.upper()
+    for fontsize, max_chars in ((92, 15), (72, 20), (56, 26)):
+        lines = _wrap_text(text, max_chars)
+        if len(lines) <= 4:
+            return fontsize, lines
+    fontsize, max_chars = 56, 26
+    lines = _wrap_text(text, max_chars)[:4]
+    return fontsize, lines
+
+
+@app.route("/thumbnail", methods=["POST"])
+def thumbnail():
+    # Gera uma capa 1280x720 chamativa: imagem de fundo (de uma das cenas do
+    # video) + texto grande em caixa alta com contorno preto, pra chamar
+    # atencao/curiosidade na lista de recomendados do YouTube.
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    image_url = data.get("imageUrl") or data.get("image_url")
+    text = str(data.get("texto") or "").strip()
+    if not text:
+        return jsonify({"error": "texto ausente"}), 400
+
+    fontsize, lines = _fit_thumbnail_text(text)
+    safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+    safe_text = "\n".join(safe_lines)
+
+    work = tempfile.mkdtemp()
+    try:
+        src = None
+        if image_url and isinstance(image_url, str) and image_url.startswith("http"):
+            src = os.path.join(work, "in_img")
+            fetch(image_url, src)
+        out = os.path.join(work, "thumbnail.jpg")
+
+        drawtext = (
+            "drawtext=fontfile=%s:text='%s':fontsize=%d:fontcolor=0xFFD400:"
+            "borderw=6:bordercolor=black:line_spacing=14:"
+            "box=1:boxcolor=black@0.35:boxborderw=24:x=(w-text_w)/2:y=h-th-70"
+            % (FONT_PATH, safe_text, fontsize)
+        )
+
+        if src:
+            cmd = [
+                "ffmpeg", "-y", "-i", src,
+                "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720," + drawtext,
+                "-frames:v", "1", "-q:v", "2", out,
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=0x14141f:s=1280x720",
+                "-vf", drawtext,
+                "-frames:v", "1", "-q:v", "2", out,
+            ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+        return send_file(out, mimetype="image/jpeg", as_attachment=True, download_name="thumbnail.jpg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.route("/debug/frame", methods=["POST"])
 def debug_frame():
     # utilitario de debug: extrai 1 frame de um video (URL ou binario cru) em
