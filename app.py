@@ -571,7 +571,6 @@ def longform():
                 seg_texto = str((seg or {}).get("texto") or "").strip()
                 if len(seg_texto) < 5:
                     continue
-                numero += 1
                 img_url = (seg or {}).get("imageUrl") or (seg or {}).get("image_url")
                 if img_url and isinstance(img_url, str) and img_url.startswith("http"):
                     image_path = os.path.join(work, "seg%d_img" % i)
@@ -581,6 +580,11 @@ def longform():
 
                 titulo_historia = str((seg or {}).get("titulo") or (seg or {}).get("titulo_historia") or "").strip()
                 if titulo_historia:
+                    # numero so avanca quando comeca uma historia nova (titulo presente) -
+                    # cada historia agora pode vir com varios trechos/imagens (partes), entao
+                    # contar toda iteracao do loop numerava a placa pelo indice do TRECHO, nao
+                    # da historia (ex: "HISTORIA 13" numa lista de 15 trechos/5 historias).
+                    numero += 1
                     card_out = os.path.join(work, "seg%d_card.mp4" % i)
                     _render_title_card(numero, titulo_historia, image_path, card_out)
                     seg_paths.append(card_out)
