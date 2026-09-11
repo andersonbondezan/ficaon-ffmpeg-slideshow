@@ -532,7 +532,7 @@ def longform():
             if len(seg_paths) == 1:
                 shutil.copy(seg_paths[0], out)
             else:
-                _concat_mp4s(seg_paths, out, width=1920, height=1080, timeout=600)
+                _concat_mp4s(seg_paths, out, width=1920, height=1080, timeout=1800)
         else:
             # modo legado: 1 texto corrido so, 1 imagem estatica pro video inteiro.
             texto = str(data.get("texto") or "").strip()
