@@ -524,5 +524,38 @@ def longform():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@app.route("/debug/frame", methods=["POST"])
+def debug_frame():
+    # utilitario de debug: extrai 1 frame de um video (URL ou binario cru) em
+    # JPEG, pra inspecionar visualmente texto/legenda sem baixar o video inteiro.
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    video_url = data.get("video")
+    at = float(data.get("at") or request.args.get("at") or 1.0)
+
+    work = tempfile.mkdtemp()
+    try:
+        src = os.path.join(work, "in.mp4")
+        if video_url and isinstance(video_url, str) and video_url.startswith("http"):
+            fetch(video_url, src)
+        elif request.data:
+            with open(src, "wb") as f:
+                f.write(request.data)
+        else:
+            return jsonify({"error": "need a video URL (JSON {video: url}) or raw video body"}), 400
+        out = os.path.join(work, "frame.jpg")
+        cmd = ["ffmpeg", "-y", "-ss", str(at), "-i", src, "-vframes", "1", "-q:v", "2", out]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+        return send_file(out, mimetype="image/jpeg", as_attachment=True, download_name="frame.jpg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
