@@ -438,10 +438,11 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
     _write_srt(_group_words(words), srt_path)
 
 
-def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True):
+def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True, width=1920, height=1080):
     # Renderiza 1 trecho isolado: narracao (+ legenda queimada, opcional) sobre
     # a imagem (ou cor solida de fallback) daquele trecho, com Ken Burns pela
-    # duracao real do audio desse trecho.
+    # duracao real do audio desse trecho. width/height parametrizados pra
+    # reaproveitar a mesma funcao no /longform (1920x1080) e no /short (1080x1920).
     work = os.path.dirname(out_path)
     tag = os.path.splitext(os.path.basename(out_path))[0]
     audio_path = os.path.join(work, "%s_audio.mp3" % tag)
@@ -471,15 +472,15 @@ def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=Tr
         # continuo (efeito Ken Burns) pela duracao do audio desse trecho.
         total_frames = max(1, int(round(duration * fps)))
         vf_parts = [
-            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
-            "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=1920x1080:fps=%d" % (total_frames, fps),
+            "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (width, height, width, height),
+            "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=%dx%d:fps=%d" % (total_frames, width, height, fps),
         ]
         src_input = ["-loop", "1", "-i", image_path]
     else:
         # sem nenhuma imagem disponivel - fallback de cor solida pra manter o
         # pipeline testavel ponta a ponta.
-        vf_parts = ["scale=1920:1080:force_original_aspect_ratio=increase", "crop=1920:1080", "setsar=1"]
-        src_input = ["-f", "lavfi", "-i", "color=c=0x14141f:s=1920x1080:r=%d" % fps]
+        vf_parts = ["scale=%d:%d:force_original_aspect_ratio=increase" % (width, height), "crop=%d:%d" % (width, height), "setsar=1"]
+        src_input = ["-f", "lavfi", "-i", "color=c=0x14141f:s=%dx%d:r=%d" % (width, height, fps)]
     if subtitles_filter:
         vf_parts.append(subtitles_filter)
     vf = ",".join(vf_parts)
@@ -545,6 +546,80 @@ def _render_title_card(numero, titulo, image_path, out_path, duration=3.0, fps=3
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError("ffmpeg failed (title card): %s" % res.stderr[-1500:])
+
+
+def _render_cta_card(texto, image_path, out_path, width=1080, height=1920, duration=3.0, fps=30):
+    # Placa final do Short: chama pro video completo no canal, sobre a mesma
+    # imagem do gancho (ou cor solida de fallback).
+    lines = _wrap_text(texto.upper(), 18)[:4]
+    safe_lines = [l.replace("\\", "").replace("'", "").replace(":", "\\:") for l in lines]
+    safe_text = "\n".join(safe_lines)
+    drawtext = (
+        "drawtext=fontfile=%s:text='%s':fontsize=64:fontcolor=0xFFD400:"
+        "borderw=6:bordercolor=black:line_spacing=14:box=1:boxcolor=black@0.55:boxborderw=28:"
+        "x=(w-text_w)/2:y=(h-text_h)/2"
+        % (FONT_PATH, safe_text)
+    )
+    vf = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,%s" % (width, height, width, height, drawtext)
+
+    inputs = []
+    if image_path:
+        inputs += ["-loop", "1", "-t", str(duration), "-i", image_path]
+    else:
+        inputs += ["-f", "lavfi", "-t", str(duration), "-i", "color=c=0x14141f:s=%dx%d:r=%d" % (width, height, fps)]
+    inputs += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=r=44100:cl=stereo"]
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-vf", vf,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", out_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if res.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError("ffmpeg failed (cta card): %s" % res.stderr[-1500:])
+
+
+@app.route("/short", methods=["POST"])
+def short():
+    # Corta um Short vertical (1080x1920) a partir do gancho de 1 historia do
+    # pipeline /longform (mesmo texto+imagem, sem gravar nada novo): narracao
+    # com legenda queimada (aqui SIM, diferente do longform, pra funcionar sem
+    # som no feed de Shorts) + placa final chamando pro video completo no canal.
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    voice = str(data.get("voice") or DEFAULT_VOICE)
+    texto = str(data.get("texto") or "").strip()
+    img_url = data.get("imageUrl") or data.get("image_url")
+    cta_texto = str(data.get("cta_texto") or "").strip() or "Historia completa no canal"
+    if len(texto) < 5:
+        return jsonify({"error": "texto muito curto ou ausente"}), 400
+
+    work = tempfile.mkdtemp()
+    try:
+        image_path = None
+        if img_url and isinstance(img_url, str) and img_url.startswith("http"):
+            image_path = os.path.join(work, "short_img")
+            fetch(img_url, image_path)
+        else:
+            image_path = _pick_background_image()
+
+        seg_out = os.path.join(work, "short_seg.mp4")
+        _render_segment(texto, voice, image_path, seg_out, width=1080, height=1920, burn_captions=True)
+
+        cta_out = os.path.join(work, "short_cta.mp4")
+        _render_cta_card(cta_texto, image_path, cta_out, width=1080, height=1920)
+
+        out = os.path.join(work, "short.mp4")
+        _concat_mp4s([seg_out, cta_out], out, width=1080, height=1920, timeout=300)
+
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="short.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 @app.route("/longform", methods=["POST"])
