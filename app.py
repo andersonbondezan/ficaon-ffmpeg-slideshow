@@ -438,7 +438,7 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
     _write_srt(_group_words(words), srt_path)
 
 
-def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True, width=1920, height=1080):
+def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True, width=1920, height=1080, zoom_dir="in"):
     # Renderiza 1 trecho isolado: narracao (+ legenda queimada, opcional) sobre
     # a imagem (ou cor solida de fallback) daquele trecho, com Ken Burns pela
     # duracao real do audio desse trecho. width/height parametrizados pra
@@ -468,12 +468,27 @@ def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=Tr
     ) if has_captions else None
 
     if image_path:
-        # imagem estatica (gerada por IA ou do banco de fundos) com zoom lento
-        # continuo (efeito Ken Burns) pela duracao do audio desse trecho.
+        # imagem estatica (gerada por IA ou do banco de fundos) com Ken Burns
+        # continuo pela duracao REAL do audio desse trecho - a taxa de zoom e
+        # calculada dinamicamente (max_zoom / total_frames) pra que o movimento
+        # nunca sature antes do fim: com taxa fixa (antiga: 0.0007/frame, teto
+        # 1.3x) qualquer trecho acima de ~14s (a maioria, ja que cada parte tem
+        # no minimo ~90s de narracao) saturava o zoom cedo e a imagem ficava
+        # congelada/estatica pelo resto do trecho - a causa raiz da baixa
+        # retencao percebida em videos longos. x/y ficam centralizados (formula
+        # padrao/segura do zoompan) - alterna zoom-in vs zoom-out por trecho
+        # (zoom_dir) so pra o movimento nao ficar repetitivo entre trechos.
         total_frames = max(1, int(round(duration * fps)))
+        max_zoom = 1.18
+        rate = (max_zoom - 1.0) / total_frames
+        if zoom_dir == "out":
+            zoom_expr = "if(eq(on,0),%.6f,max(zoom-%.8f,1.0))" % (max_zoom, rate)
+        else:
+            zoom_expr = "min(zoom+%.8f,%.6f)" % (rate, max_zoom)
         vf_parts = [
             "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (width, height, width, height),
-            "zoompan=z='min(zoom+0.0007,1.3)':d=%d:s=%dx%d:fps=%d" % (total_frames, width, height, fps),
+            "zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=%d:s=%dx%d:fps=%d"
+            % (zoom_expr, total_frames, width, height, fps),
         ]
         src_input = ["-loop", "1", "-i", image_path]
     else:
@@ -665,7 +680,9 @@ def longform():
                     seg_paths.append(card_out)
 
                 seg_out = os.path.join(work, "seg%d.mp4" % i)
-                _render_segment(seg_texto, voice, image_path, seg_out, burn_captions=False)
+                # alterna zoom-in/zoom-out por trecho pra o movimento nao ficar
+                # repetitivo entre os ~15+ trechos do mesmo video.
+                _render_segment(seg_texto, voice, image_path, seg_out, burn_captions=False, zoom_dir=("in" if i % 2 == 0 else "out"))
                 seg_paths.append(seg_out)
             if not seg_paths:
                 return jsonify({"error": "nenhum segmento valido recebido"}), 400
