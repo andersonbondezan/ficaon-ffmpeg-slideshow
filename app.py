@@ -438,6 +438,43 @@ def _synthesize_with_captions(text, voice, audio_path, srt_path):
     _write_srt(_group_words(words), srt_path)
 
 
+def _kenburns_filter(width, height, total_frames, zoom_dir="in", max_zoom=1.18):
+    # Zoom continuo (Ken Burns) SEM tremor. O `zoompan` antigo arredondava a
+    # posicao da janela para pixel inteiro a cada quadro: com zoom lento (~1500
+    # quadros por trecho) a janela andava ~0,1px/quadro e "pulava" 1px a cada
+    # ~9 quadros - ~68% dos quadros saiam identicos ao anterior (medido), o que
+    # aparece como imagem tremendo/travando. O `perspective` aceita coordenadas
+    # fracionarias e interpola por sub-pixel, entao o zoom avanca suave a cada
+    # quadro (passos entre quadros uniformes, sem picos). Interpolacao linear:
+    # nitidez equivalente ao cubico com zoom <= 1.18x e ~30% mais rapido.
+    # O movimento dura o trecho INTEIRO (taxa = (max_zoom-1)/total_frames), nunca
+    # satura antes do fim; "out" faz o caminho inverso (max_zoom -> 1.0).
+    rate = (max_zoom - 1.0) / max(1, total_frames)
+    if zoom_dir == "out":
+        z = "max(1,%.6f-%.8f*on)" % (max_zoom, rate)
+    else:
+        z = "min(%.6f,1+%.8f*on)" % (max_zoom, rate)
+    return (
+        "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,"
+        "perspective=x0='W/2-W/(2*%s)':y0='H/2-H/(2*%s)':x1='W/2+W/(2*%s)':y1='H/2-H/(2*%s)':"
+        "x2='W/2-W/(2*%s)':y2='H/2+H/(2*%s)':x3='W/2+W/(2*%s)':y3='H/2+H/(2*%s)':"
+        "interpolation=linear:eval=frame"
+    ) % (width, height, width, height, z, z, z, z, z, z, z, z)
+
+
+def _kenburns_filter_legacy(width, height, total_frames, zoom_dir="in", fps=30, max_zoom=1.18):
+    # Versao antiga (zoompan) - so como rede de seguranca se o filtro novo falhar.
+    rate = (max_zoom - 1.0) / max(1, total_frames)
+    if zoom_dir == "out":
+        zoom_expr = "if(eq(on,0),%.6f,max(zoom-%.8f,1.0))" % (max_zoom, rate)
+    else:
+        zoom_expr = "min(zoom+%.8f,%.6f)" % (rate, max_zoom)
+    return (
+        "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,"
+        "zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=%d:s=%dx%d:fps=%d"
+    ) % (width, height, width, height, zoom_expr, total_frames, width, height, fps)
+
+
 def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=True, width=1920, height=1080, zoom_dir="in"):
     # Renderiza 1 trecho isolado: narracao (+ legenda queimada, opcional) sobre
     # a imagem (ou cor solida de fallback) daquele trecho, com Ken Burns pela
@@ -479,38 +516,48 @@ def _render_segment(texto, voice, image_path, out_path, fps=30, burn_captions=Tr
         # padrao/segura do zoompan) - alterna zoom-in vs zoom-out por trecho
         # (zoom_dir) so pra o movimento nao ficar repetitivo entre trechos.
         total_frames = max(1, int(round(duration * fps)))
-        max_zoom = 1.18
-        rate = (max_zoom - 1.0) / total_frames
-        if zoom_dir == "out":
-            zoom_expr = "if(eq(on,0),%.6f,max(zoom-%.8f,1.0))" % (max_zoom, rate)
-        else:
-            zoom_expr = "min(zoom+%.8f,%.6f)" % (rate, max_zoom)
-        vf_parts = [
-            "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (width, height, width, height),
-            "zoompan=z='%s':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=%d:s=%dx%d:fps=%d"
-            % (zoom_expr, total_frames, width, height, fps),
+        # tentativa 1: zoom suave por `perspective` (-framerate = fps de saida:
+        # sem isso a imagem em loop entra a 25fps e o -r 30 duplica quadros, o
+        # que reintroduz tremor). tentativa 2 (rede de seguranca, so roda se o
+        # ffmpeg do container rejeitar o filtro novo): `zoompan` antigo.
+        attempts = [
+            ([_kenburns_filter(width, height, total_frames, zoom_dir)],
+             ["-loop", "1", "-framerate", str(fps), "-i", image_path]),
+            ([_kenburns_filter_legacy(width, height, total_frames, zoom_dir, fps)],
+             ["-loop", "1", "-i", image_path]),
         ]
-        src_input = ["-loop", "1", "-i", image_path]
     else:
         # sem nenhuma imagem disponivel - fallback de cor solida pra manter o
         # pipeline testavel ponta a ponta.
-        vf_parts = ["scale=%d:%d:force_original_aspect_ratio=increase" % (width, height), "crop=%d:%d" % (width, height), "setsar=1"]
-        src_input = ["-f", "lavfi", "-i", "color=c=0x14141f:s=%dx%d:r=%d" % (width, height, fps)]
-    if subtitles_filter:
-        vf_parts.append(subtitles_filter)
-    vf = ",".join(vf_parts)
+        attempts = [(
+            ["scale=%d:%d:force_original_aspect_ratio=increase" % (width, height), "crop=%d:%d" % (width, height), "setsar=1"],
+            ["-f", "lavfi", "-i", "color=c=0x14141f:s=%dx%d:r=%d" % (width, height, fps)],
+        )]
 
-    cmd = ["ffmpeg", "-y"] + src_input + [
-        "-i", audio_path,
-        "-vf", vf,
-        "-map", "0:v", "-map", "1:a",
-        "-t", str(duration),
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path,
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if res.returncode != 0 or not os.path.exists(out_path):
-        raise RuntimeError("ffmpeg failed: %s" % res.stderr[-1500:])
+    last_err = ""
+    for i, (base_parts, src_input) in enumerate(attempts):
+        vf_parts = list(base_parts)
+        if subtitles_filter:
+            vf_parts.append(subtitles_filter)
+        cmd = ["ffmpeg", "-y"] + src_input + [
+            "-i", audio_path,
+            "-vf", ",".join(vf_parts),
+            "-map", "0:v", "-map", "1:a",
+            "-t", str(duration),
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path,
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            last_err = "timeout no ffmpeg (tentativa %d)" % (i + 1)
+            print("[_render_segment] %s" % last_err, flush=True)
+            continue
+        if res.returncode == 0 and os.path.exists(out_path):
+            return
+        last_err = res.stderr[-1500:]
+        print("[_render_segment] tentativa %d falhou: %s" % (i + 1, last_err[-300:]), flush=True)
+    raise RuntimeError("ffmpeg failed: %s" % last_err)
 
 
 def _fit_title_card_text(titulo):
