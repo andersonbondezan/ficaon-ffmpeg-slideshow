@@ -5,6 +5,10 @@ import shutil
 import glob
 import random
 import urllib.request
+import json
+import threading
+import time
+import uuid
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
 import edge_tts
@@ -750,6 +754,146 @@ def longform():
         return jsonify({"error": str(e)}), 500
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# --- Jobs em background (compilacoes longas, ~1h+ de video) ---
+# O /longform sincrono estoura os timeouts (gunicorn/n8n) com videos de 1h, que
+# levam ~1h30 pra renderizar. Aqui o render roda numa thread, historia por
+# historia (cada uma concatenada com re-encode), e o final junta as historias
+# com concat demuxer -c copy (todas saem do mesmo _concat_mp4s, mesmos params).
+# Estado fica em disco pra sobreviver a qualquer worker que atenda o GET.
+JOBS_DIR = "/tmp/jobs"
+
+
+def _job_path(job_id, ext):
+    return os.path.join(JOBS_DIR, "%s.%s" % (job_id, ext))
+
+
+def _job_write(job_id, **fields):
+    path = _job_path(job_id, "json")
+    state = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            state = json.load(f)
+    state.update(fields)
+    state["updated_at"] = time.time()
+    with open(path + ".tmp", "w") as f:
+        json.dump(state, f)
+    os.replace(path + ".tmp", path)
+
+
+def _run_longform_job(job_id, segmentos, voice):
+    work = tempfile.mkdtemp()
+    try:
+        # agrupa trechos por historia (titulo presente = comeca historia nova)
+        historias = []
+        for seg in segmentos:
+            seg = seg or {}
+            if len(str(seg.get("texto") or "").strip()) < 5:
+                continue
+            titulo = str(seg.get("titulo") or seg.get("titulo_historia") or "").strip()
+            if titulo or not historias:
+                historias.append([])
+            historias[-1].append(seg)
+        if not historias:
+            raise RuntimeError("nenhum segmento valido recebido")
+
+        total = sum(len(h) for h in historias)
+        feitos = 0
+        story_paths = []
+        i = 0
+        for n, partes in enumerate(historias, start=1):
+            parts_paths = []
+            for k, seg in enumerate(partes):
+                img_url = seg.get("imageUrl") or seg.get("image_url")
+                if img_url and isinstance(img_url, str) and img_url.startswith("http"):
+                    image_path = os.path.join(work, "h%d_p%d_img" % (n, k))
+                    fetch(img_url, image_path)
+                else:
+                    image_path = _pick_background_image()
+                titulo = str(seg.get("titulo") or seg.get("titulo_historia") or "").strip()
+                if titulo:
+                    card_out = os.path.join(work, "h%d_card.mp4" % n)
+                    _render_title_card(n, titulo, image_path, card_out)
+                    parts_paths.append(card_out)
+                seg_out = os.path.join(work, "h%d_p%d.mp4" % (n, k))
+                _render_segment(str(seg.get("texto")).strip(), voice, image_path, seg_out,
+                                burn_captions=False, zoom_dir=("in" if i % 2 == 0 else "out"))
+                parts_paths.append(seg_out)
+                i += 1
+                feitos += 1
+                _job_write(job_id, progress="%d/%d trechos" % (feitos, total), historia=n)
+            story_out = os.path.join(work, "story%03d.mp4" % n)
+            _concat_mp4s(parts_paths, story_out, width=1920, height=1080, timeout=1800)
+            for p in parts_paths:
+                if os.path.exists(p):
+                    os.remove(p)
+            story_paths.append(story_out)
+
+        list_path = os.path.join(work, "list.txt")
+        with open(list_path, "w") as f:
+            for p in story_paths:
+                f.write("file '%s'\n" % p)
+        out = _job_path(job_id, "mp4")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+               "-c", "copy", "-movflags", "+faststart", out]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if res.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("ffmpeg concat final failed: %s" % res.stderr[-1500:])
+        _job_write(job_id, status="done", historias=len(story_paths), bytes=os.path.getsize(out))
+    except Exception as e:
+        _job_write(job_id, status="error", error=str(e)[-2000:])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.route("/job/longform", methods=["POST"])
+def job_longform_start():
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    segmentos = data.get("segmentos")
+    if not isinstance(segmentos, list) or not segmentos:
+        return jsonify({"error": "segmentos obrigatorio"}), 400
+    voice = str(data.get("voice") or DEFAULT_VOICE)
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    job_id = uuid.uuid4().hex[:12]
+    _job_write(job_id, status="running", progress="0/%d trechos" % len(segmentos), started_at=time.time())
+    threading.Thread(target=_run_longform_job, args=(job_id, segmentos, voice), daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "running"})
+
+
+@app.route("/job/<job_id>", methods=["GET"])
+def job_status(job_id):
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    path = _job_path(os.path.basename(job_id), "json")
+    if not os.path.exists(path):
+        return jsonify({"error": "job nao encontrado"}), 404
+    with open(path) as f:
+        return jsonify(json.load(f))
+
+
+@app.route("/job/<job_id>/file", methods=["GET"])
+def job_file(job_id):
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    out = _job_path(os.path.basename(job_id), "mp4")
+    if not os.path.exists(out):
+        return jsonify({"error": "arquivo nao disponivel"}), 404
+    return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="compilacao.mp4")
+
+
+@app.route("/job/<job_id>", methods=["DELETE"])
+def job_delete(job_id):
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+    job_id = os.path.basename(job_id)
+    for ext in ("json", "mp4"):
+        p = _job_path(job_id, ext)
+        if os.path.exists(p):
+            os.remove(p)
+    return jsonify({"deleted": job_id})
 
 
 def _fit_thumbnail_text(text):
