@@ -250,6 +250,91 @@ def watermark():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _media_duration(path):
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        return float(res.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _has_audio_stream(path):
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    return bool(res.stdout.strip())
+
+
+@app.route("/mix", methods=["POST"])
+def mix():
+    # Mistura uma trilha de fundo no video. A trilha abaixa sozinha quando ha fala (ducking),
+    # fica em loop se for mais curta que o video e some com fade no final.
+    # Video: corpo cru (binario) ou JSON {video: url}. Trilha: ?music=url ou JSON {music: url}.
+    # Sem trilha, devolve o video como veio.
+    if request.headers.get("x-token") != TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    video_url = data.get("video")
+    music_url = str(data.get("music") or request.args.get("music") or "").strip()
+    try:
+        vol = float(data.get("volume") or request.args.get("volume") or 0.35)
+    except ValueError:
+        vol = 0.35
+    vol = max(0.05, min(1.0, vol))
+
+    work = tempfile.mkdtemp()
+    try:
+        src = os.path.join(work, "in.mp4")
+        if video_url and isinstance(video_url, str) and video_url.startswith("http"):
+            fetch(video_url, src)
+        elif request.data:
+            with open(src, "wb") as f:
+                f.write(request.data)
+        else:
+            return jsonify({"error": "need a video URL (JSON {video: url}) or raw video body"}), 400
+
+        if not music_url.startswith("http"):
+            return send_file(src, mimetype="video/mp4", as_attachment=True, download_name="mixed.mp4")
+
+        music = os.path.join(work, "music.in")
+        fetch(music_url, music)
+        dur = _media_duration(src)
+        if dur <= 0:
+            return jsonify({"error": "could not read video duration"}), 500
+        fade_start = max(0.0, dur - 1.5)
+        out = os.path.join(work, "mixed.mp4")
+
+        bg = "[1:a]volume=%.3f,afade=t=in:st=0:d=0.6,afade=t=out:st=%.2f:d=1.5[bg]" % (vol, fade_start)
+        if _has_audio_stream(src):
+            filt = (
+                bg + ";[0:a]asplit=2[d1][d2];"
+                "[bg][d1]sidechaincompress=threshold=0.02:ratio=10:attack=5:release=300[duck];"
+                "[d2][duck]amix=inputs=2:duration=first:normalize=0[a]"
+            )
+        else:
+            filt = bg + ";[bg]anull[a]"
+
+        cmd = [
+            "ffmpeg", "-y", "-i", src, "-stream_loop", "-1", "-i", music,
+            "-filter_complex", filt,
+            "-map", "0:v", "-map", "[a]", "-t", "%.2f" % dur,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0 or not os.path.exists(out):
+            return jsonify({"error": "ffmpeg failed", "stderr": res.stderr[-1500:]}), 500
+        return send_file(out, mimetype="video/mp4", as_attachment=True, download_name="mixed.mp4")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @app.route("/tiktok/hashtag", methods=["POST"])
 def tiktok_hashtag():
     if request.headers.get("x-token") != TOKEN:
