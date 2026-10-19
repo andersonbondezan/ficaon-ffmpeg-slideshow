@@ -39,8 +39,7 @@ def slideshow():
     images = data.get("images") or []
     secs = float(data.get("seconds_each", 3))
     audio_url = data.get("audioUrl")
-    images = [u for u in images if isinstance(u, str) and u.startswith("http")][:14]
-    durations = data.get("durations")
+    images = [u for u in images if isinstance(u, str) and u.startswith("http")][:10]
     if len(images) < 2:
         return jsonify({"error": "need at least 2 image URLs"}), 400
 
@@ -71,23 +70,11 @@ def slideshow():
             if audio_duration and audio_duration > 0:
                 secs = audio_duration / len(paths)
 
-        # Duracao por imagem: se vier `durations` (mesma qtd de imagens), usa como
-        # PESO proporcional e escala pra caber na duracao real do audio (ou, sem audio,
-        # usa os segundos informados). Sem `durations`, divide igualmente (comportamento antigo).
-        secs_list = [secs] * len(paths)
-        try:
-            if isinstance(durations, list) and len(durations) == len(paths):
-                w = [max(float(x), 0.3) for x in durations]
-                base = (secs * len(paths)) if audio_path else sum(w)
-                secs_list = [base * x / sum(w) for x in w]
-        except (ValueError, TypeError):
-            secs_list = [secs] * len(paths)
-
-        total = sum(secs_list)
+        total = secs * len(paths)
 
         inputs = []
-        for idx, p in enumerate(paths):
-            inputs += ["-loop", "1", "-t", str(secs_list[idx]), "-i", p]
+        for p in paths:
+            inputs += ["-loop", "1", "-t", str(secs), "-i", p]
         if audio_path:
             inputs += ["-i", audio_path]
         else:
